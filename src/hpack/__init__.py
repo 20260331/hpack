@@ -4,10 +4,11 @@ HTTP/2 header encoding for Python.
 from __future__ import annotations
 
 from .exceptions import HPACKDecodingError, HPACKError, InvalidTableIndex, InvalidTableIndexError, InvalidTableSizeError, OversizedHeaderListError
-from .hpack import Decoder, Encoder
+from .hpack import Decoder, DecodeSession, Encoder
 from .struct import HeaderTuple, NeverIndexedHeaderTuple
 
 __all__ = [
+    "DecodeSession",
     "Decoder",
     "Encoder",
     "HPACKDecodingError",

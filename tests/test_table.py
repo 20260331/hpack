@@ -141,3 +141,31 @@ class TestHeaderTable:
         tbl.maxsize = 146
         assert len(tbl.dynamic_entries) == 2
         assert tbl._current_size == 98
+
+    def test_copy_is_independent(self):
+        tbl = HeaderTable()
+        tbl.add(b'TestName', b'TestValue')
+
+        clone = tbl.copy()
+        clone.add(b'OtherName', b'OtherValue')
+        clone.maxsize = 100
+
+        # The source table is unaffected by changes to the copy.
+        assert list(tbl.dynamic_entries) == [(b'TestName', b'TestValue')]
+        assert tbl.maxsize == HeaderTable.DEFAULT_SIZE
+        assert list(clone.dynamic_entries) == [
+            (b'OtherName', b'OtherValue'),
+            (b'TestName', b'TestValue'),
+        ]
+
+    def test_adopt_replaces_state(self):
+        tbl = HeaderTable()
+        clone = tbl.copy()
+        clone.add(b'TestName', b'TestValue')
+        clone.maxsize = 100
+
+        tbl.adopt(clone)
+
+        assert list(tbl.dynamic_entries) == [(b'TestName', b'TestValue')]
+        assert tbl.maxsize == 100
+        assert tbl._current_size == clone._current_size

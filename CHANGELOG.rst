@@ -10,6 +10,13 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added ``Decoder.begin_decode()`` and the ``DecodeSession`` class for
+  decoding a single HPACK header block that is delivered across several
+  fragments. Integers, length-prefixed strings, and Huffman-encoded strings
+  may span fragment boundaries; the owning ``Decoder`` is not modified until
+  the session finishes successfully, and truncated or aborted sessions can be
+  safely discarded.
+
 **Bugfixes**
 
 

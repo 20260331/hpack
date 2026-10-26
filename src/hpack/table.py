@@ -1,4 +1,6 @@
 # flake8: noqa
+from __future__ import annotations
+
 from collections import deque
 import logging
 from typing import Optional
@@ -136,6 +138,33 @@ class HeaderTable:
                 return self.dynamic_entries[index]
 
         raise InvalidTableIndex("Invalid table index %d" % original_index)
+
+    def copy(self) -> HeaderTable:
+        """
+        Returns an independent working copy of this table.
+
+        The copy has its own dynamic entry deque, so entries can be added,
+        evicted, and resized without affecting the source table. The
+        immutable name/value byte strings are shared between the two tables.
+        """
+        working_copy = HeaderTable()
+        working_copy._maxsize = self._maxsize
+        working_copy._current_size = self._current_size
+        working_copy.resized = self.resized
+        working_copy.dynamic_entries = self.dynamic_entries.copy()
+        return working_copy
+
+    def adopt(self, other: HeaderTable) -> None:
+        """
+        Replaces this table's state with the state of ``other``.
+
+        This commits the changes accumulated in a working :meth:`copy` back
+        into the table it was derived from.
+        """
+        self._maxsize = other._maxsize
+        self._current_size = other._current_size
+        self.resized = other.resized
+        self.dynamic_entries = other.dynamic_entries
 
     def __repr__(self) -> str:
         return "HeaderTable(%d, %s, %r)" % (

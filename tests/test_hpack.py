@@ -5,6 +5,7 @@ from hypothesis import given
 from hypothesis.strategies import text, binary, sets, one_of
 
 from hpack import (
+    DecodeSession,
     Encoder,
     Decoder,
     HeaderTuple,
@@ -14,7 +15,7 @@ from hpack import (
     OversizedHeaderListError,
     InvalidTableSizeError,
 )
-from hpack.hpack import _dict_to_iterable, _to_bytes
+from hpack.hpack import _dict_to_iterable, _to_bytes, encode_integer
 
 
 def test_to_bytes():
@@ -765,6 +766,447 @@ class TestHPACKDecoder:
 
         with pytest.raises(HPACKDecodingError):
             d.decode(data)
+
+
+class TestDecodeSession:
+    """
+    Tests for the explicit incremental decoding session used to decode header
+    blocks that arrive in several fragments.
+    """
+
+    def _build_blocks(self, huffman):
+        encoder = Encoder()
+        headers = [
+            (':method', 'GET'),
+            (':scheme', 'https'),
+            (':path', '/'),
+            (':authority', 'www.example.com'),
+            ('custom-key', 'custom-value'),
+            ('z' * 200, 'q' * 200),
+        ]
+        first_block = encoder.encode(headers, huffman=huffman)
+        second_block = encoder.encode(
+            [(':method', 'GET'), ('custom-key', 'custom-value')],
+            huffman=huffman,
+        )
+        return first_block, second_block, headers
+
+    def _feed_byte_by_byte(self, decoder, data, raw=False):
+        session = decoder.begin_decode(raw=raw)
+        produced = []
+        for byte in data:
+            produced += session.feed(bytes([byte]))
+        return session.finish(), produced
+
+    def test_begin_decode_returns_a_session(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        assert isinstance(session, DecodeSession)
+
+    def test_single_feed_matches_decode(self):
+        first_block, _, headers = self._build_blocks(huffman=True)
+
+        fragmented_decoder = Decoder()
+        session = fragmented_decoder.begin_decode()
+        assert session.feed(first_block) == headers
+        assert session.finish() == headers
+
+        reference = Decoder()
+        reference.decode(first_block)
+        assert list(fragmented_decoder.header_table.dynamic_entries) == \
+            list(reference.header_table.dynamic_entries)
+
+    @pytest.mark.parametrize('huffman', [False, True])
+    def test_byte_by_byte_fragments(self, huffman):
+        first_block, second_block, headers = self._build_blocks(huffman)
+
+        decoder = Decoder()
+        result, produced = self._feed_byte_by_byte(decoder, first_block)
+
+        assert result == headers
+        assert produced == headers
+
+        reference = Decoder()
+        reference.decode(first_block)
+        assert list(decoder.header_table.dynamic_entries) == \
+            list(reference.header_table.dynamic_entries)
+
+        # A subsequent block may reference the dynamic entries committed by
+        # the fragmented block.
+        result, _ = self._feed_byte_by_byte(decoder, second_block)
+        assert result == reference.decode(second_block)
+
+    @pytest.mark.parametrize('huffman', [False, True])
+    def test_split_at_every_position(self, huffman):
+        first_block, second_block, headers = self._build_blocks(huffman)
+
+        for cut in range(len(first_block) + 1):
+            reference = Decoder()
+            assert reference.decode(first_block) == headers
+            follow_up = reference.decode(second_block)
+
+            decoder = Decoder()
+            session = decoder.begin_decode()
+            produced = session.feed(first_block[:cut])
+            produced += session.feed(first_block[cut:])
+
+            assert session.finish() == headers
+            assert produced == headers
+            assert list(decoder.header_table.dynamic_entries) == \
+                list(reference.header_table.dynamic_entries)
+            assert decoder.decode(second_block) == follow_up
+
+    def test_feed_returns_headers_as_they_complete(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+
+        assert session.feed(b'\x82') == [(':method', 'GET')]
+        assert session.feed(b'\x86') == [(':scheme', 'http')]
+        assert session.finish() == [(':method', 'GET'), (':scheme', 'http')]
+
+    def test_empty_fragments_and_empty_block(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+
+        assert session.feed(b'') == []
+        assert session.feed(b'') == []
+        assert session.finish() == []
+
+        # A second, non-empty session on the same decoder still works.
+        session = decoder.begin_decode()
+        assert session.feed(b'') == []
+        assert session.feed(b'\x82') == [(':method', 'GET')]
+        assert session.finish() == [(':method', 'GET')]
+
+    def test_accepts_bytearray_and_memoryview(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+
+        assert session.feed(bytearray(b'\x82\x86')) == [
+            (':method', 'GET'),
+            (':scheme', 'http'),
+        ]
+        assert session.feed(memoryview(b'\x84')) == [(':path', '/')]
+        assert session.finish() == [
+            (':method', 'GET'),
+            (':scheme', 'http'),
+            (':path', '/'),
+        ]
+
+    def test_huffman_string_spans_fragments(self):
+        data = b'\x82\x86\x84\x01\x8c\xf1\xe3\xc2\xe5\xf2:k\xa0\xab\x90\xf4\xff'
+        headers = [
+            (':method', 'GET'),
+            (':scheme', 'http'),
+            (':path', '/'),
+            (':authority', 'www.example.com'),
+        ]
+
+        decoder = Decoder()
+        result, _ = self._feed_byte_by_byte(decoder, data)
+        assert result == headers
+
+    def test_empty_huffman_encoded_strings(self):
+        # Literal name and value are both zero-length strings flagged as
+        # Huffman encoded.
+        data = b'\x00\x80\x80'
+
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        assert session.feed(data[:1]) == []
+        assert session.feed(data[1:]) == [('', '')]
+        assert session.finish() == [('', '')]
+
+    def test_literal_with_indexed_name_spans_fragments(self):
+        decoder = Decoder()
+        result, _ = self._feed_byte_by_byte(decoder, b'\x44\x0c/sample/path')
+        assert result == [(':path', '/sample/path')]
+        assert len(decoder.header_table.dynamic_entries) == 1
+
+    def test_never_indexed_spans_fragments(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\x10\x0acustom-k')
+        session.feed(b'ey\x0dcustom-header')
+
+        headers = session.finish()
+        assert len(headers) == 1
+        assert isinstance(headers[0], NeverIndexedHeaderTuple)
+        assert len(decoder.header_table.dynamic_entries) == 0
+
+    def test_multibyte_string_length_integer_spans_fragments(self):
+        # Literal with incremental indexing, empty raw name, 200 byte value.
+        length = encode_integer(200, 7)
+        data = b'\x40\x00' + bytes(length) + b'v' * 200
+
+        assert len(length) == 2
+        split = 2 + len(length) - 1
+
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        assert session.feed(data[:split]) == []
+        assert session.feed(data[split:]) == [('', 'v' * 200)]
+        assert session.finish() == [('', 'v' * 200)]
+        assert list(decoder.header_table.dynamic_entries) == [
+            (b'', b'v' * 200),
+        ]
+
+    def test_multibyte_dynamic_index_spans_fragments(self):
+        encoder = Encoder()
+        decoder = Decoder()
+        setup = encoder.encode([(f'h{i:02d}', 'v') for i in range(70)], huffman=False)
+        decoder.decode(setup)
+
+        # The oldest dynamic entry (h00) is now at dynamic index 131, which
+        # needs a continuation byte in the indexed representation integer.
+        follow_up = encoder.encode([('h00', 'v')], huffman=False)
+        assert follow_up == b'\xff\x04'
+
+        session = decoder.begin_decode()
+        assert session.feed(follow_up[:1]) == []
+        assert session.feed(follow_up[1:]) == [('h00', 'v')]
+        assert session.finish() == [('h00', 'v')]
+
+    def test_table_size_update_integer_spans_fragments(self):
+        # Two table size updates (128 and 4096) followed by indexed headers,
+        # delivered one byte at a time.
+        data = b'?a?\xe1\x1f\x82\x87\x84'
+
+        decoder = Decoder()
+        result, _ = self._feed_byte_by_byte(decoder, data)
+        assert result == [(':method', 'GET'), (':scheme', 'https'), (':path', '/')]
+        assert decoder.header_table_size == 4096
+
+    def test_raw_decoding_spans_fragments(self):
+        raw_name = b'\x00\x01\x99\x30\x11\x22\x55\x21\x89\x14'
+        data = b'\x40\x0a' + raw_name + b'\x0dcustom-header'
+
+        decoder = Decoder()
+        session = decoder.begin_decode(raw=True)
+        produced = session.feed(data[:7])
+        produced += session.feed(data[7:])
+
+        assert produced == [(raw_name, b'custom-header')]
+        assert session.finish() == [(raw_name, b'custom-header')]
+
+    def test_decoder_state_is_unchanged_until_finish(self):
+        data = b'@\ncustom-key\rcustom-header'
+
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(data[:8])
+        session.feed(data[8:])
+
+        # The header would be indexed, but the owning decoder must not know
+        # about it until finish() succeeds.
+        assert list(decoder.header_table.dynamic_entries) == []
+
+        assert session.finish() == [('custom-key', 'custom-header')]
+        assert list(decoder.header_table.dynamic_entries) == [
+            (b'custom-key', b'custom-header'),
+        ]
+
+    def test_truncated_integer_at_finish_leaves_decoder_untouched(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\xff')
+
+        with pytest.raises(HPACKDecodingError):
+            session.finish()
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_truncated_string_at_finish_leaves_decoder_untouched(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\x40\x0acustom-key\x0dcustom-he')
+
+        with pytest.raises(HPACKDecodingError):
+            session.finish()
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_invalid_indexed_header_recovers(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+
+        with pytest.raises(InvalidTableIndex):
+            session.feed(b'\xbe')
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_invalid_indexed_literal_name_recovers(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+
+        with pytest.raises(InvalidTableIndex):
+            session.feed(b'\x82\x86\x84\x7f\x0a\x0fwww.example.com')
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_varint_too_long_spanning_fragments_recovers(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\xff\x80\x80\x80')
+
+        with pytest.raises(HPACKDecodingError):
+            session.feed(b'\x80\x80\x80')
+
+        # Prior committed state is intact and a new session works.
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_invalid_huffman_string_recovers(self):
+        # Empty literal name followed by a one-byte Huffman value that is
+        # invalid.
+        decoder = Decoder()
+        session = decoder.begin_decode()
+
+        with pytest.raises(HPACKDecodingError):
+            session.feed(b'\x00\x00\x81\xff')
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_table_size_update_above_maximum_recovers(self):
+        decoder = Decoder()
+        decoder.max_allowed_table_size = 127
+        session = decoder.begin_decode()
+        session.feed(b'?')
+
+        with pytest.raises(InvalidTableSizeError):
+            session.feed(b'a')
+
+        assert decoder.header_table_size == 4096
+        decoder.max_allowed_table_size = 4096
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_unshrunk_table_rejected_at_finish(self):
+        decoder = Decoder()
+        decoder.max_allowed_table_size = 128
+        session = decoder.begin_decode()
+        session.feed(b'\x82')
+
+        with pytest.raises(InvalidTableSizeError):
+            session.finish()
+
+        assert decoder.header_table_size == 4096
+        decoder.max_allowed_table_size = 4096
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_table_size_update_after_header_rejected(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\x82')
+
+        with pytest.raises(HPACKDecodingError):
+            session.feed(b'?a')
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_oversized_header_list_recovers(self):
+        decoder = Decoder(max_header_list_size=44)
+        session = decoder.begin_decode()
+        session.feed(b'\x14\x0c/sample')
+
+        with pytest.raises(OversizedHeaderListError):
+            session.feed(b'/path')
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_invalid_utf8_recovers(self):
+        decoder = Decoder()
+        data = b'\x82\x86\x84\x01\x10www.\x07\xaa\xd7\x95\xd7\xa8\xd7\x94.com'
+
+        session = decoder.begin_decode()
+        session.feed(data[:10])
+
+        with pytest.raises(HPACKDecodingError):
+            session.feed(data[10:])
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_abort_discards_the_session(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'@\ncustom-key\rcustom-header')
+        session.abort()
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_abort_is_idempotent(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\x82')
+        session.abort()
+        session.abort()
+
+        # Aborting a successfully finished session is also a no-op.
+        session = decoder.begin_decode()
+        session.feed(b'\x82')
+        session.finish()
+        session.abort()
+
+    def test_context_manager_commits_on_finish(self):
+        decoder = Decoder()
+        with decoder.begin_decode() as session:
+            produced = session.feed(b'\x82\x86')
+            headers = session.finish()
+
+        assert produced == [(':method', 'GET'), (':scheme', 'http')]
+        assert headers == [(':method', 'GET'), (':scheme', 'http')]
+
+    def test_context_manager_aborts_on_exception(self):
+        decoder = Decoder()
+        with pytest.raises(RuntimeError):
+            with decoder.begin_decode() as session:
+                session.feed(b'@\ncustom-key\rcustom-header')
+                raise RuntimeError("something else went wrong")
+
+        assert list(decoder.header_table.dynamic_entries) == []
+        assert decoder.decode(b'\x82') == [(':method', 'GET')]
+
+    def test_session_cannot_be_reused_after_finish(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\x82')
+        session.finish()
+
+        with pytest.raises(RuntimeError):
+            session.feed(b'\x82')
+        with pytest.raises(RuntimeError):
+            session.finish()
+
+    def test_session_cannot_be_used_after_abort(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        session.feed(b'\x82')
+        session.abort()
+
+        with pytest.raises(RuntimeError):
+            session.feed(b'\x82')
+        with pytest.raises(RuntimeError):
+            session.finish()
+
+    def test_session_cannot_be_used_after_error(self):
+        decoder = Decoder()
+        session = decoder.begin_decode()
+        with pytest.raises(InvalidTableIndex):
+            session.feed(b'\xbe')
+
+        with pytest.raises(RuntimeError):
+            session.feed(b'\x82')
+        with pytest.raises(RuntimeError):
+            session.finish()
+
+        session.abort()  # still safe to call
 
 
 class TestDictToIterable:

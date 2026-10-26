@@ -7,7 +7,10 @@ This document provides the HPACK API.
    :members: header_table_size, encode
 
 .. autoclass:: hpack.Decoder
-   :members: header_table_size, decode
+   :members: header_table_size, decode, begin_decode
+
+.. autoclass:: hpack.DecodeSession
+   :members: feed, finish, abort
 
 .. autoclass:: hpack.HeaderTuple
    :members: indexable
