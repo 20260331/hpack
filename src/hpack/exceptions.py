@@ -51,3 +51,15 @@ class InvalidTableSizeError(HPACKDecodingError):
 
     .. versionadded:: 3.0.0
     """
+
+
+class InvalidBlockEditError(HPACKError):
+    """
+    An attempted edit of a parsed HPACK block cannot be applied: either the
+    edited target is not a literal (for example an indexed header name), or
+    the re-encoded block would violate the dynamic table and indexing rules,
+    such as an index that no longer resolves after an entry grew or was
+    evicted.
+
+    .. versionadded:: 4.3.0
+    """

@@ -10,6 +10,8 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added a lossless ``HeaderBlock`` representation tree (RFC 7541 section 6) that records the exact wire representation and byte span of every indexed field, literal field and table size update. Unmodified blocks serialize back byte-for-byte; individual literal names and values can be edited in place with ``LiteralHeaderField.set_name``/``set_value``, and re-serialization is replayed against the dynamic table so edited blocks keep obeying the indexing and table-size rules (raising ``InvalidBlockEditError`` otherwise).
+
 **Bugfixes**
 
 
