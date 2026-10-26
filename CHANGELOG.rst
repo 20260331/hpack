@@ -10,6 +10,10 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added ``hpack.Transcoder`` for intermediaries that rewrite HPACK header blocks. It drives two independent compression contexts (an input-side ``Decoder`` and an output-side ``Encoder``) one complete block at a time, with a field rewrite callback and a documented state boundary: decode failures roll both sides back, while callback or encode failures keep the decoded input side committed and roll the output side back.
+- Added ``hpack.TranscodeAbortedError`` for callbacks that deliberately abort a transcoded block.
+- Added ``HeaderTable.snapshot()`` and ``HeaderTable.restore()`` to capture and roll back dynamic-table state.
+
 **Bugfixes**
 
 

@@ -51,3 +51,19 @@ class InvalidTableSizeError(HPACKDecodingError):
 
     .. versionadded:: 3.0.0
     """
+
+
+class TranscodeAbortedError(HPACKError):
+    """
+    A header-block transcode was deliberately aborted by its field rewrite
+    callback.
+
+    Raise this (or any other exception) from a
+    :class:`hpack.transcoder.Transcoder` callback to reject a complete block.
+    The exception propagates to the caller and the two HPACK contexts are
+    left at the documented failure boundary: the input side stays committed
+    to the fully decoded block, while the output side is rolled back as if
+    the block had never been encoded.
+
+    .. versionadded:: 4.3.0
+    """

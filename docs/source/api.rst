@@ -9,6 +9,9 @@ This document provides the HPACK API.
 .. autoclass:: hpack.Decoder
    :members: header_table_size, decode
 
+.. autoclass:: hpack.Transcoder
+   :members: transcode, decoder, encoder
+
 .. autoclass:: hpack.HeaderTuple
    :members: indexable
 
@@ -26,3 +29,5 @@ This document provides the HPACK API.
 .. autoclass:: hpack.OversizedHeaderListError
 
 .. autoclass:: hpack.InvalidTableSizeError
+
+.. autoclass:: hpack.TranscodeAbortedError

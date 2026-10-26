@@ -1,7 +1,7 @@
 # flake8: noqa
 from collections import deque
 import logging
-from typing import Optional
+from typing import Optional, TypeAlias
 
 from .exceptions import InvalidTableIndex
 
@@ -21,6 +21,11 @@ def table_entry_size(name: bytes, value: bytes) -> int:
     See RFC7541 Section 4.1
     """
     return 32 + len(name) + len(value)
+
+
+#: Opaque, restorable dynamic-table state captured by
+#: :meth:`HeaderTable.snapshot` and consumed by :meth:`HeaderTable.restore`.
+HeaderTableState: TypeAlias = tuple[deque[tuple[bytes, bytes]], int, int, bool]
 
 
 class HeaderTable:
@@ -112,6 +117,36 @@ class HeaderTable:
         self._current_size = 0
         self.resized = False
         self.dynamic_entries: deque[tuple[bytes, bytes]] = deque()
+
+    def snapshot(self) -> HeaderTableState:
+        """
+        Captures the mutable dynamic-table state as an opaque token.
+
+        The returned token is an independent copy: mutating the table after
+        taking the snapshot does not affect it. It can be passed back to
+        :meth:`restore` to roll the table back to the captured state. Only
+        mutable state is captured; the static table is immutable.
+        """
+        return (
+            deque(self.dynamic_entries),
+            self._current_size,
+            self._maxsize,
+            self.resized,
+        )
+
+    def restore(self, state: HeaderTableState) -> None:
+        """
+        Restores dynamic-table state previously captured with :meth:`snapshot`.
+
+        This assigns the captured state directly, bypassing the side effects
+        of the ``maxsize`` setter (eviction, resize flag), so the table ends
+        up byte-for-byte in the state it was in when the snapshot was taken.
+        """
+        entries, current_size, maxsize, resized = state
+        self.dynamic_entries = deque(entries)
+        self._current_size = current_size
+        self._maxsize = maxsize
+        self.resized = resized
 
     def get_by_index(self, index: int) -> tuple[bytes, bytes]:
         """
