@@ -7,6 +7,10 @@ from .exceptions import InvalidTableIndex
 
 log = logging.getLogger(__name__)
 
+#: Opaque snapshot of a HeaderTable state:
+#: ``(maxsize, current_size, resized, dynamic_entries)``.
+TableState = tuple[int, int, bool, tuple[tuple[bytes, bytes], ...]]
+
 
 def table_entry_size(name: bytes, value: bytes) -> int:
     """
@@ -143,6 +147,44 @@ class HeaderTable:
             self.resized,
             self.dynamic_entries
         )
+
+    def copy(self) -> "HeaderTable":
+        """
+        Returns an independent copy of this header table.
+
+        The copy shares no mutable state with the original: entries added
+        to or evicted from either table do not affect the other. Dynamic
+        table entries themselves are tuples of immutable byte strings, so
+        a shallow copy of the entries is sufficient.
+        """
+        new_table = HeaderTable()
+        new_table.restore(self.snapshot())
+        return new_table
+
+    def snapshot(self) -> TableState:
+        """
+        Returns an opaque, comparable snapshot of the table's state.
+
+        The snapshot can be compared to detect whether the table has
+        changed and handed back to :meth:`restore`.
+        """
+        return (
+            self._maxsize,
+            self._current_size,
+            self.resized,
+            tuple(self.dynamic_entries),
+        )
+
+    def restore(self, state: TableState) -> None:
+        """
+        Restores the table to a state previously captured with
+        :meth:`snapshot`, replacing its dynamic entries in the process.
+        """
+        maxsize, current_size, resized, entries = state
+        self._maxsize = maxsize
+        self._current_size = current_size
+        self.resized = resized
+        self.dynamic_entries = deque(entries)
 
     def add(self, name: bytes, value: bytes) -> None:
         """

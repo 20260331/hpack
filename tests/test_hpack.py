@@ -7,6 +7,7 @@ from hypothesis.strategies import text, binary, sets, one_of
 from hpack import (
     Encoder,
     Decoder,
+    EncodingPlan,
     HeaderTuple,
     NeverIndexedHeaderTuple,
     HPACKDecodingError,
@@ -366,6 +367,265 @@ class TestHPACKEncoder:
         header_set = headers_generator()
         out = e.encode(header_set)
         assert Decoder().decode(out) == list(headers_generator())
+
+    def test_add_serializes_against_the_live_table(self):
+        e = Encoder()
+
+        out = e.add((b'custom-key', b'custom-header'), sensitive=False, huffman=False)
+
+        assert out == b'\x40\x0acustom-key\x0dcustom-header'
+        assert list(e.header_table.dynamic_entries) == [
+            (b'custom-key', b'custom-header'),
+        ]
+
+        # A repeat add references the now indexed dynamic table entry.
+        assert e.add(
+            (b'custom-key', b'custom-header'), sensitive=False, huffman=False,
+        ) == b'\xbe'
+
+
+class TestHPACKEncoderPlanning:
+    def test_plan_does_not_mutate_encoder(self):
+        e = Encoder()
+        header_set = [
+            ('custom-key', 'custom-header'),
+            ('another-key', 'another-value'),
+        ]
+
+        plan = e.plan(header_set, huffman=False)
+
+        assert isinstance(plan, EncodingPlan)
+        # The encoder's dynamic table is untouched by planning.
+        assert list(e.header_table.dynamic_entries) == []
+        assert e.header_table._current_size == 0
+        assert e.header_table.resized is False
+        # The plan still carries the same bytes a real encode would emit.
+        assert plan.encoded == Encoder().encode(header_set, huffman=False)
+
+    def test_plan_uses_scratch_table_for_intra_block_indexing(self):
+        """
+        Later headers in a planned block may reference entries added by
+        earlier headers within the same block.
+        """
+        e = Encoder()
+        header_set = [
+            ('custom-key', 'custom-header'),
+            ('custom-key', 'custom-header'),
+        ]
+
+        plan = e.plan(header_set, huffman=False)
+
+        # Literal with indexing followed by an indexed reference (index 62,
+        # the first dynamic table slot).
+        assert plan.encoded == b'\x40\x0acustom-key\x0dcustom-header\xbe'
+        assert list(e.header_table.dynamic_entries) == []
+
+        out = e.commit(plan)
+
+        assert out == plan.encoded
+        assert Decoder().decode(out) == header_set
+        assert list(e.header_table.dynamic_entries) == [
+            (b'custom-key', b'custom-header'),
+        ]
+
+    def test_multiple_candidates_from_the_same_state(self):
+        """
+        Several plans with different ordering or Huffman options can be
+        derived from the same state and compared; only the committed one
+        mutates the encoder.
+        """
+        e = Encoder()
+        order_a = [(':method', 'GET'), ('a', '1'), ('b', '2')]
+        order_b = [(':method', 'GET'), ('b', '2'), ('a', '1')]
+
+        plan_a = e.plan(order_a, huffman=False)
+        plan_b = e.plan(order_b, huffman=False)
+        plan_huffman = e.plan(order_a, huffman=True)
+
+        # Nothing has been committed yet.
+        assert list(e.header_table.dynamic_entries) == []
+
+        # Every candidate is a self-contained, decodable header block.
+        assert Decoder().decode(plan_a.encoded) == order_a
+        assert Decoder().decode(plan_b.encoded) == order_b
+        assert Decoder().decode(plan_huffman.encoded) == order_a
+
+        # Candidates can be compared by encoded size before choosing one.
+        chosen = min((plan_a, plan_b, plan_huffman), key=lambda p: len(p.encoded))
+        assert isinstance(chosen, EncodingPlan)
+
+        out = e.commit(plan_b)
+
+        assert out == plan_b.encoded
+        # The committed ordering determines the dynamic table layout: the
+        # last indexed header is at the front of the table.
+        assert list(e.header_table.dynamic_entries) == [
+            (b'a', b'1'),
+            (b'b', b'2'),
+        ]
+
+    def test_commit_returns_encoded_bytes(self):
+        e = Encoder()
+        plan = e.plan({'custom-key': 'custom-header'}, huffman=False)
+
+        out = e.commit(plan)
+
+        assert out == b'\x40\x0acustom-key\x0dcustom-header'
+        assert list(e.header_table.dynamic_entries) == [
+            (b'custom-key', b'custom-header'),
+        ]
+
+    def test_plan_commit_sequence_matches_encode(self):
+        """
+        A plan/commit driven encoder stays byte-for-byte and table-for-table
+        identical to an encode driven one across consecutive requests.
+        """
+        planned = Encoder()
+        direct = Encoder()
+        header_sets = [
+            [
+                (':method', 'GET'),
+                (':scheme', 'http'),
+                (':path', '/'),
+                (':authority', 'www.example.com'),
+            ],
+            [
+                (':method', 'GET'),
+                (':scheme', 'http'),
+                (':path', '/'),
+                (':authority', 'www.example.com'),
+                ('cache-control', 'no-cache'),
+            ],
+            [
+                (':method', 'GET'),
+                (':scheme', 'https'),
+                (':path', '/index.html'),
+                (':authority', 'www.example.com'),
+                ('custom-key', 'custom-value'),
+            ],
+        ]
+
+        for header_set in header_sets:
+            plan = planned.plan(header_set, huffman=False)
+            assert plan.encoded == direct.encode(header_set, huffman=False)
+            planned.commit(plan)
+            assert (
+                list(planned.header_table.dynamic_entries)
+                == list(direct.header_table.dynamic_entries)
+            )
+            assert (
+                planned.header_table._current_size
+                == direct.header_table._current_size
+            )
+
+    def test_plan_does_not_consume_pending_table_size_change(self):
+        e = Encoder()
+        e.header_table_size = 40
+        header_set = [(':method', 'GET')]
+
+        plan = e.plan(header_set, huffman=False)
+
+        # A discarded plan neither clears the resized flag nor the pending
+        # size changes, so the encoder still signals the resize later.
+        assert e.header_table.resized is True
+        assert e.table_size_changes == [40]
+        assert plan.encoded == b'?\t\x82'
+        assert e.encode(header_set, huffman=False) == b'?\t\x82'
+        assert e.header_table.resized is False
+        assert e.table_size_changes == []
+
+    def test_commit_emits_pending_table_size_change(self):
+        e = Encoder()
+        e.header_table_size = 40
+
+        out = e.commit(e.plan([(':method', 'GET')], huffman=False))
+
+        assert out == b'?\t\x82'
+        assert e.header_table.resized is False
+        assert e.table_size_changes == []
+
+    def test_commit_emits_multiple_pending_table_size_changes(self):
+        e = Encoder()
+        e.header_table_size = 40
+        e.header_table_size = 100
+        e.header_table_size = 40
+
+        out = e.commit(e.plan([(':method', 'GET')], huffman=False))
+
+        assert out == b'\x3f\x09\x3f\x45\x3f\x09\x82'
+        assert e.table_size_changes == []
+
+    def test_planned_sensitive_header_is_not_indexed_on_commit(self):
+        e = Encoder()
+        header_set = [('customkey', 'sensitiveinfo', True)]
+
+        plan = e.plan(header_set, huffman=False)
+
+        assert plan.encoded == b'\x10\x09customkey\x0dsensitiveinfo'
+        assert list(e.header_table.dynamic_entries) == []
+        e.commit(plan)
+        assert list(e.header_table.dynamic_entries) == []
+
+    def test_discarded_plan_does_not_apply_evictions(self):
+        e = Encoder()
+        e.header_table_size = 66
+        e.encode([('a', 'b')], huffman=False)
+
+        plan = e.plan(
+            [('long-custom-header', 'longish value')], huffman=False,
+        )
+
+        # The live table still holds the entry the scratch copy would evict.
+        assert list(e.header_table.dynamic_entries) == [(b'a', b'b')]
+        # Abandon the plan; a subsequent plan sees the same base state.
+        assert e.plan(
+            [('long-custom-header', 'longish value')], huffman=False,
+        ).encoded == plan.encoded
+
+        e.commit(plan)
+        assert len(e.header_table.dynamic_entries) == 1
+
+    def test_commit_with_generator_does_not_reiterate(self):
+        e = Encoder()
+        headers = (("k" + str(i), "v" + str(i)) for i in range(3))
+
+        plan = e.plan(headers, huffman=False)
+        out = e.commit(plan)
+
+        assert Decoder().decode(out) == [
+            ('k0', 'v0'), ('k1', 'v1'), ('k2', 'v2'),
+        ]
+        assert len(e.header_table.dynamic_entries) == 3
+
+    def test_commit_rejects_stale_plan(self):
+        e = Encoder()
+        plan = e.plan([('a', '1')], huffman=False)
+
+        e.encode([('b', '2')], huffman=False)
+
+        with pytest.raises(ValueError):
+            e.commit(plan)
+
+    def test_commit_rejects_committing_plan_twice(self):
+        e = Encoder()
+        plan = e.plan([('a', '1')], huffman=False)
+
+        e.commit(plan)
+
+        with pytest.raises(ValueError):
+            e.commit(plan)
+
+    def test_commit_rejects_non_plan(self):
+        with pytest.raises(TypeError):
+            Encoder().commit(b'not a plan')
+
+    def test_commit_rejects_plan_from_another_encoder(self):
+        other = Encoder()
+        other.encode([('a', '1')], huffman=False)
+        plan = other.plan([('b', '2')], huffman=False)
+
+        with pytest.raises(ValueError):
+            Encoder().commit(plan)
 
 
 class TestHPACKDecoder:

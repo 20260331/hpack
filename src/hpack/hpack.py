@@ -11,7 +11,7 @@ from .huffman import HuffmanEncoder
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from .huffman_table import decode_huffman
 from .struct import HeaderTuple, HeaderWeaklyTyped, NeverIndexedHeaderTuple
-from .table import HeaderTable, table_entry_size
+from .table import HeaderTable, TableState, table_entry_size
 
 if TYPE_CHECKING:
     from collections.abc import Iterable  # pragma: no cover
@@ -159,6 +159,54 @@ def _to_bytes(value: bytes | str | Any) -> bytes:
     return value.encode("utf-8")  # type: ignore
 
 
+class EncodingPlan:
+    """
+    A tentative HPACK encoding of a header block that does not mutate the
+    :class:`Encoder` it was planned from.
+
+    Plans are returned by :meth:`Encoder.plan`. Any number of candidate
+    plans may be derived from the same encoder state (for example, to
+    compare different header orderings or Huffman choices) and inspected
+    through :attr:`encoded`; only the plan passed to
+    :meth:`Encoder.commit` advances the encoder's dynamic table.
+
+    A plan is bound to the encoder state it was planned from. Committing it
+    once that state has changed (for example, because another plan was
+    committed, or the table was resized) raises ``ValueError``.
+    """
+
+    def __init__(
+        self,
+        encoded: bytes,
+        base_state: tuple[TableState, tuple[int, ...]],
+        result_table_state: TableState,
+    ) -> None:
+        #: The HPACK-encoded header block that would be emitted.
+        self.encoded = encoded
+        self._base_state = base_state
+        self._result_table_state = result_table_state
+
+    def commit_into(self, encoder: Encoder) -> None:
+        """
+        Applies this plan to ``encoder``, provided its state is still the
+        state the plan was planned from. Intended for use by
+        :meth:`Encoder.commit`.
+        """
+        current_state = (
+            encoder.header_table.snapshot(),
+            tuple(encoder.table_size_changes),
+        )
+        if current_state != self._base_state:
+            msg = (
+                "Cannot commit an EncodingPlan planned from a different "
+                "encoder state"
+            )
+            raise ValueError(msg)
+
+        encoder.header_table.restore(self._result_table_state)
+        encoder.table_size_changes = []
+
+
 class Encoder:
     """
     An HPACK encoder object. This object takes HTTP headers and emits encoded
@@ -235,20 +283,101 @@ class Encoder:
 
         :returns: A bytestring containing the HPACK-encoded header block.
         """
-        # Transforming the headers into a header block is a procedure that can
-        # be modeled as a chain or pipe. First, the headers are encoded. This
-        # encoding can be done a number of ways. If the header name-value pair
-        # are already in the header table we can represent them using the
-        # indexed representation: the same is true if they are in the static
-        # table. Otherwise, a literal representation will be used.
+        return self.commit(self.plan(headers, huffman=huffman))
+
+    def plan(self,
+             headers: Iterable[\
+                 HeaderTuple | \
+                 tuple[bytes | str, bytes | str] | \
+                 tuple[bytes | str, bytes | str, bool | None]] | \
+                 dict[bytes | str, bytes | str],
+             huffman: bool = True) -> EncodingPlan:
+        """
+        Encodes a set of headers into an :class:`EncodingPlan` without
+        mutating the encoder.
+
+        Accepts exactly the same arguments as :meth:`encode`. The encoded
+        bytes are available as :attr:`EncodingPlan.encoded`, but the
+        dynamic table, the pending table size changes and the ``resized``
+        flag are left untouched. Any number of candidate plans may
+        therefore be derived from the same encoder state, for example to
+        compare different header orderings or Huffman options. Pass the
+        chosen plan to :meth:`commit` to apply it.
+
+        :param headers: The headers to encode. See :meth:`encode` for the
+                        accepted formats.
+        :param huffman: (optional) Whether to Huffman-encode any header
+                        sent as a literal value.
+        :returns: An :class:`EncodingPlan` holding the tentative encoding.
+        """
+        base_state = (
+            self.header_table.snapshot(),
+            tuple(self.table_size_changes),
+        )
+
+        # Every tentative mutation happens on an independent scratch copy of
+        # the table, so discarded candidates leave the encoder untouched.
+        scratch = self.header_table.copy()
+        table_size_changes = list(self.table_size_changes)
+
         header_block = []
 
         # Before we begin, if the header table size has been changed we need
         # to signal all changes since last emission appropriately.
-        if self.header_table.resized:
-            header_block.append(self._encode_table_size_change())
-            self.header_table.resized = False
+        if scratch.resized:
+            header_block.append(
+                self._encode_table_size_change(table_size_changes),
+            )
+            scratch.resized = False
 
+        # Add each header to the header block
+        for name, value, sensitive in self._normalize_headers(headers):
+            header_block.append(
+                self._add((name, value), sensitive, huffman, scratch),
+            )
+
+        encoded = b"".join(header_block)
+
+        log.debug("Planned header block to %s", encoded)
+
+        return EncodingPlan(encoded, base_state, scratch.snapshot())
+
+    def commit(self, plan: EncodingPlan) -> bytes:
+        """
+        Applies an :class:`EncodingPlan` previously produced by
+        :meth:`plan`, advancing the encoder's dynamic table to the state
+        recorded in the plan.
+
+        :param plan: The chosen encoding plan.
+        :returns: The HPACK-encoded header block from the plan, ready to be
+                  sent.
+        :raises TypeError: If ``plan`` is not an :class:`EncodingPlan`.
+        :raises ValueError: If the encoder state has changed since the plan
+                            was planned, or the plan has already been
+                            committed.
+        """
+        if not isinstance(plan, EncodingPlan):
+            msg = f"Expected an EncodingPlan, got {type(plan).__name__}"
+            raise TypeError(msg)
+
+        plan.commit_into(self)
+
+        log.debug("Committed header block %s", plan.encoded)
+
+        return plan.encoded
+
+    @staticmethod
+    def _normalize_headers(
+        headers: HeaderTuple | \
+                  tuple[bytes | str, bytes | str] | \
+                  tuple[bytes | str, bytes | str, bool | None] | \
+                  dict[bytes | str, bytes | str] | \
+                  Iterable[Any],
+    ) -> Iterable[tuple[bytes, bytes, bool]]:
+        """
+        Normalizes the accepted header inputs into an iterable of
+        ``(name, value, sensitive)`` byte-string tuples.
+        """
         if isinstance(headers, dict):
             # Turn the headers into a list of tuples if possible. This is the
             # natural way to interact with them in HPACK. Because dictionaries are
@@ -274,9 +403,8 @@ class Encoder:
                 ('customkey', 'sensitiveinfo', True),
             ]
             """
-            hpack_headers = iter(headers)  # type: ignore
+            hpack_headers = iter(headers)
 
-        # Add each header to the header block
         for header in hpack_headers:
             sensitive = False
             if isinstance(header, HeaderTuple):
@@ -285,14 +413,7 @@ class Encoder:
             elif len(header) > 2:
                 sensitive = header[2]
 
-            new_header = (_to_bytes(header[0]), _to_bytes(header[1]))
-            header_block.append(self.add(new_header, sensitive, huffman))
-
-        encoded = b"".join(header_block)
-
-        log.debug("Encoded header block to %s", encoded)
-
-        return encoded
+            yield _to_bytes(header[0]), _to_bytes(header[1]), sensitive
 
     def add(self, to_add: tuple[bytes, bytes], sensitive: bool, huffman: bool = False) -> bytes:
         """
@@ -302,6 +423,19 @@ class Encoder:
         (see https://www.rfc-editor.org/rfc/rfc7541.html#section-7.1.3 for details),
         furthermore, the header value will be redacted in debug logs, as "SENSITIVE_REDACTED",
         to prevent accidental exposure of sensitive information.
+        """
+        return self._add(to_add, sensitive, huffman, self.header_table)
+
+    def _add(
+        self,
+        to_add: tuple[bytes, bytes],
+        sensitive: bool,
+        huffman: bool,
+        header_table: HeaderTable,
+    ) -> bytes:
+        """
+        Serializes a header key-value tuple against the given header table,
+        mutating that table when the representation allows indexing.
         """
         name, value = to_add
 
@@ -318,14 +452,14 @@ class Encoder:
         indexbit = INDEX_INCREMENTAL if not sensitive else INDEX_NEVER
 
         # Search for a matching header in the header table.
-        match = self.header_table.search(name, value)
+        match = header_table.search(name, value)
 
         if match is None:
             # Not in the header table. Encode using the literal syntax,
             # and add it to the header table.
             encoded = self._encode_literal(name, value, indexbit, huffman)
             if not sensitive:
-                self.header_table.add(name, value)
+                header_table.add(name, value)
             return encoded
 
         # The header is in the table, break out the values. If we matched
@@ -346,7 +480,7 @@ class Encoder:
                 index, value, indexbit, huffman,
             )
             if not sensitive:
-                self.header_table.add(name, value)
+                header_table.add(name, value)
 
         return encoded
 
@@ -401,17 +535,17 @@ class Encoder:
 
         return b"".join([bytes(prefix), bytes(value_len), value])
 
-    def _encode_table_size_change(self) -> bytes:
+    def _encode_table_size_change(self, table_size_changes: list[int]) -> bytes:
         """
         Produces the encoded form of all header table size change context
-        updates.
+        updates found in ``table_size_changes``, clearing that list.
         """
         block = b""
-        for size_bytes in self.table_size_changes:
+        for size_bytes in table_size_changes:
             b = encode_integer(size_bytes, 5)
             b[0] |= 0x20
             block += bytes(b)
-        self.table_size_changes = []
+        table_size_changes.clear()
         return block
 
 

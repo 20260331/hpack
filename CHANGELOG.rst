@@ -10,6 +10,8 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added ``Encoder.plan`` and ``Encoder.commit`` together with the ``EncodingPlan`` class, allowing several candidate encodings (such as different header orderings or Huffman options) to be trialed from the same encoder state without advancing the dynamic table. Only the plan passed to ``commit`` mutates the encoder.
+
 **Bugfixes**
 
 
