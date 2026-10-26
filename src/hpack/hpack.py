@@ -6,12 +6,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import HPACKDecodingError, InvalidTableSizeError, OversizedHeaderListError
+from .exceptions import HPACKDecodingError, InvalidContextError, InvalidTableSizeError, OversizedHeaderListError
 from .huffman import HuffmanEncoder
 from .huffman_constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from .huffman_table import decode_huffman
 from .struct import HeaderTuple, HeaderWeaklyTyped, NeverIndexedHeaderTuple
-from .table import HeaderTable, table_entry_size
+from .table import HeaderTable, strict_nonnegative_int, table_entry_size
 
 if TYPE_CHECKING:
     from collections.abc import Iterable  # pragma: no cover
@@ -23,6 +23,20 @@ INDEX_NEVER = b"\x10"
 INDEX_INCREMENTAL = b"\x40"
 
 VARINT_MAX_LENGTH = 5 # octets, enough for encoding prefix + uint32
+
+#: Version of the portable compression-context format produced by
+#: :meth:`Encoder.export_context` / :meth:`Decoder.export_context` and accepted
+#: by the corresponding ``import_context`` methods. Bump whenever the layout of
+#: the exported document changes.
+CONTEXT_VERSION = 1
+
+_CONTEXT_ENCODER_ROLE = "encoder"
+_CONTEXT_DECODER_ROLE = "decoder"
+_ENCODER_CONTEXT_KEYS = {"version", "role", "header_table", "table_size_changes"}
+_DECODER_CONTEXT_KEYS = {
+    "version", "role", "header_table",
+    "max_header_list_size", "max_allowed_table_size",
+}
 
 # Precompute 2^i for 1-8 for use in prefix calcs.
 # Zero index is not used but there to save a subtraction
@@ -157,6 +171,23 @@ def _to_bytes(value: bytes | str | Any) -> bytes:
     if t is not str:
         value = str(value)
     return value.encode("utf-8")  # type: ignore
+
+
+def _validate_context_envelope(context: Any, role: str) -> dict[str, Any]:
+    """
+    Validates the common, versioned envelope of an exported compression
+    context and returns it unchanged.
+    """
+    if not isinstance(context, dict):
+        msg = "compression context must be an object"
+        raise InvalidContextError(msg)
+    if context.get("version") != CONTEXT_VERSION:
+        msg = f"unsupported compression context version: expected {CONTEXT_VERSION}"
+        raise InvalidContextError(msg)
+    if context.get("role") != role:
+        msg = f"compression context role mismatch: expected {role!r}"
+        raise InvalidContextError(msg)
+    return context
 
 
 class Encoder:
@@ -413,6 +444,78 @@ class Encoder:
             block += bytes(b)
         self.table_size_changes = []
         return block
+
+    def export_context(self) -> dict[str, Any]:
+        """
+        Exports the complete header compression context as a versioned
+        document made only of plain Python data (dictionaries, lists,
+        integers and byte strings), so it can be serialized to another
+        process.
+
+        Beyond the dynamic table, the snapshot includes the current table
+        capacity, the resize flag and every not-yet-signalled table size
+        change, so a restored encoder emits the exact same bytes for the next
+        header block as an encoder that kept running in this process.
+
+        :returns: A context document compatible with
+                  :meth:`import_context`.
+
+        .. versionadded:: 4.3.0
+        """
+        return {
+            "version": CONTEXT_VERSION,
+            "role": _CONTEXT_ENCODER_ROLE,
+            "header_table": self.header_table.export_state(),
+            "table_size_changes": list(self.table_size_changes),
+        }
+
+    def import_context(self, context: Any) -> None:
+        """
+        Restores the complete header compression context previously produced
+        by :meth:`export_context` (typically in another process).
+
+        Every field is validated and the new state is built in full before it
+        is committed, so an invalid document raises
+        :class:`InvalidContextError <hpack.InvalidContextError>` and leaves
+        this encoder completely unchanged.
+
+        :param context: The context document returned by
+                        :meth:`export_context`.
+        :raises InvalidContextError: If the document is not a valid encoder
+                                     context for :data:`CONTEXT_VERSION`.
+
+        .. versionadded:: 4.3.0
+        """
+        payload = _validate_context_envelope(context, _CONTEXT_ENCODER_ROLE)
+        if set(payload.keys()) != _ENCODER_CONTEXT_KEYS:
+            msg = "encoder context has missing or unexpected fields"
+            raise InvalidContextError(msg)
+
+        header_table = HeaderTable.restore_state(payload["header_table"])
+
+        raw_changes = payload["table_size_changes"]
+        if not isinstance(raw_changes, (list, tuple)):
+            msg = "table_size_changes must be a list"
+            raise InvalidContextError(msg)
+        table_size_changes = [
+            strict_nonnegative_int(value, "table_size_changes[]")
+            for value in raw_changes
+        ]
+
+        # The resize flag is only ever set together with queueing a change, so
+        # a set flag without a queued change is unreachable in a live encoder
+        # and indicates a corrupted context. The final queued size is always
+        # the table's current capacity.
+        if header_table.resized and not table_size_changes:
+            msg = "header table is marked resized but no size change is queued"
+            raise InvalidContextError(msg)
+        if table_size_changes and table_size_changes[-1] != header_table.maxsize:
+            msg = "last table size change does not match header table maxsize"
+            raise InvalidContextError(msg)
+
+        # All checks passed: commit atomically.
+        self.header_table = header_table
+        self.table_size_changes = table_size_changes
 
 
 class Decoder:
@@ -675,3 +778,70 @@ class Decoder:
         )
 
         return header, total_consumed
+
+    def export_context(self) -> dict[str, Any]:
+        """
+        Exports the complete header compression context as a versioned
+        document made only of plain Python data (dictionaries, lists,
+        integers and byte strings), so it can be serialized to another
+        process.
+
+        Beyond the dynamic table, the snapshot includes the current table
+        capacity, the decoder's ``max_allowed_table_size`` limit (the last
+        acknowledged SETTINGS_HEADER_TABLE_SIZE) and ``max_header_list_size``,
+        so a restored decoder accepts exactly the same next header block as a
+        decoder that kept running in this process.
+
+        :returns: A context document compatible with
+                  :meth:`import_context`.
+
+        .. versionadded:: 4.3.0
+        """
+        return {
+            "version": CONTEXT_VERSION,
+            "role": _CONTEXT_DECODER_ROLE,
+            "header_table": self.header_table.export_state(),
+            "max_header_list_size": self.max_header_list_size,
+            "max_allowed_table_size": self.max_allowed_table_size,
+        }
+
+    def import_context(self, context: Any) -> None:
+        """
+        Restores the complete header compression context previously produced
+        by :meth:`export_context` (typically in another process).
+
+        Every field is validated and the new state is built in full before it
+        is committed, so an invalid document raises
+        :class:`InvalidContextError <hpack.InvalidContextError>` and leaves
+        this decoder completely unchanged.
+
+        :param context: The context document returned by
+                        :meth:`export_context`.
+        :raises InvalidContextError: If the document is not a valid decoder
+                                     context for :data:`CONTEXT_VERSION`.
+
+        .. versionadded:: 4.3.0
+        """
+        payload = _validate_context_envelope(context, _CONTEXT_DECODER_ROLE)
+        if set(payload.keys()) != _DECODER_CONTEXT_KEYS:
+            msg = "decoder context has missing or unexpected fields"
+            raise InvalidContextError(msg)
+
+        header_table = HeaderTable.restore_state(payload["header_table"])
+        max_header_list_size = strict_nonnegative_int(
+            payload["max_header_list_size"], "max_header_list_size",
+        )
+        max_allowed_table_size = strict_nonnegative_int(
+            payload["max_allowed_table_size"], "max_allowed_table_size",
+        )
+
+        # Note: maxsize may legitimately exceed max_allowed_table_size in the
+        # window after a smaller SETTINGS_HEADER_TABLE_SIZE was acknowledged
+        # but before the peer's next block shrinks the table. That protocol
+        # state is restored faithfully; _assert_valid_table_size() keeps
+        # enforcing it on the next decode exactly as before the transfer.
+
+        # All checks passed: commit atomically.
+        self.header_table = header_table
+        self.max_header_list_size = max_header_list_size
+        self.max_allowed_table_size = max_allowed_table_size

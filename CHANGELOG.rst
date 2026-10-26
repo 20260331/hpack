@@ -10,6 +10,14 @@ dev
 
 **API Changes (Backward Compatible)**
 
+- Added versioned ``Encoder.export_context``/``import_context`` and
+  ``Decoder.export_context``/``import_context`` for moving the complete header
+  compression context (dynamic table, table capacity, pending size updates and
+  decoder limits) to another process. Imported documents are fully validated
+  and restored atomically; malformed documents raise ``InvalidContextError``
+  and leave the target object unchanged. The format version is exposed as
+  ``CONTEXT_VERSION``.
+
 **Bugfixes**
 
 

@@ -1,11 +1,34 @@
 # flake8: noqa
+from __future__ import annotations
+
 from collections import deque
 import logging
-from typing import Optional
+from typing import Any, Optional
 
-from .exceptions import InvalidTableIndex
+from .exceptions import InvalidContextError, InvalidTableIndex
 
 log = logging.getLogger(__name__)
+
+#: Largest integer carried by the portable context format. HPACK table sizes
+#: are SETTINGS_HEADER_TABLE_SIZE values, which are uint32.
+MAX_CONTEXT_INT = 2 ** 32 - 1
+
+_CONTEXT_TABLE_KEYS = {"maxsize", "current_size", "resized", "entries"}
+
+
+def strict_nonnegative_int(value: Any, field: str, *, maximum: int = MAX_CONTEXT_INT) -> int:
+    """
+    Validates that ``value`` is a plain nonnegative integer not exceeding
+    ``maximum``. Booleans are rejected despite being ``int`` subclasses, since
+    the context format does not treat them as integers.
+    """
+    if type(value) is not int:
+        msg = f"{field} must be an integer, got {type(value).__name__}"
+        raise InvalidContextError(msg)
+    if not 0 <= value <= maximum:
+        msg = f"{field} must be between 0 and {maximum}, got {value}"
+        raise InvalidContextError(msg)
+    return value
 
 
 def table_entry_size(name: bytes, value: bytes) -> int:
@@ -218,6 +241,92 @@ class HeaderTable:
             cursize -= table_entry_size(name, value)
             log.debug("Evicting %s: %s from the header table", name, value)
         self._current_size = cursize
+
+    def export_state(self) -> dict[str, Any]:
+        """
+        Snapshots the dynamic table as plain, portable data.
+
+        Entries are emitted newest-first, exactly in dynamic table index
+        order, as ``[name, value]`` byte-string pairs.
+        """
+        return {
+            "maxsize": self._maxsize,
+            "current_size": self._current_size,
+            "resized": self.resized,
+            "entries": [[name, value] for name, value in self.dynamic_entries],
+        }
+
+    @classmethod
+    def restore_state(cls, state: Any) -> HeaderTable:
+        """
+        Validates a dynamic-table state document and builds a brand new
+        :class:`HeaderTable` from it. No existing table is mutated, so callers
+        can atomically swap the returned table into an Encoder or Decoder
+        only after validation has fully succeeded.
+        """
+        if not isinstance(state, dict):
+            msg = "header_table context must be an object"
+            raise InvalidContextError(msg)
+        if set(state.keys()) != _CONTEXT_TABLE_KEYS:
+            msg = "header_table context has missing or unexpected fields"
+            raise InvalidContextError(msg)
+
+        maxsize = strict_nonnegative_int(state["maxsize"], "header_table.maxsize")
+        current_size = strict_nonnegative_int(
+            state["current_size"], "header_table.current_size",
+        )
+
+        resized = state["resized"]
+        if type(resized) is not bool:
+            msg = "header_table.resized must be a boolean"
+            raise InvalidContextError(msg)
+
+        raw_entries = state["entries"]
+        if not isinstance(raw_entries, (list, tuple)):
+            msg = "header_table.entries must be a list"
+            raise InvalidContextError(msg)
+
+        entries: deque[tuple[bytes, bytes]] = deque()
+        computed_size = 0
+        for position, raw_entry in enumerate(raw_entries):
+            name, value, entry_size = _validate_table_entry(raw_entry, position, maxsize)
+            computed_size += entry_size
+            entries.append((name, value))
+
+        if computed_size != current_size:
+            msg = "header_table.current_size does not match the size of the entries"
+            raise InvalidContextError(msg)
+        if computed_size > maxsize:
+            msg = "header table entries exceed header_table.maxsize"
+            raise InvalidContextError(msg)
+
+        table = cls()
+        table._maxsize = maxsize
+        table._current_size = computed_size
+        table.resized = resized
+        table.dynamic_entries = entries
+        return table
+
+
+def _validate_table_entry(
+    raw_entry: Any, position: int, maxsize: int,
+) -> tuple[bytes, bytes, int]:
+    """
+    Validates one ``[name, value]`` dynamic-table entry and returns the
+    byte strings together with their RFC 7541 entry size.
+    """
+    if not isinstance(raw_entry, (list, tuple)) or len(raw_entry) != 2:
+        msg = f"header_table.entries[{position}] must be a (name, value) pair"
+        raise InvalidContextError(msg)
+    name, value = raw_entry
+    if not isinstance(name, bytes) or not isinstance(value, bytes):
+        msg = f"header_table.entries[{position}] name and value must be bytes"
+        raise InvalidContextError(msg)
+    entry_size = table_entry_size(name, value)
+    if entry_size > maxsize:
+        msg = f"header_table.entries[{position}] does not fit in header_table.maxsize"
+        raise InvalidContextError(msg)
+    return name, value, entry_size
 
 
 def _build_static_table_mapping() -> dict[bytes, tuple[int, dict[bytes, int]]]:

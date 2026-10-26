@@ -51,3 +51,17 @@ class InvalidTableSizeError(HPACKDecodingError):
 
     .. versionadded:: 3.0.0
     """
+
+
+class InvalidContextError(HPACKError):
+    """
+    A compression context passed to :meth:`Encoder.import_context
+    <hpack.Encoder.import_context>` or :meth:`Decoder.import_context
+    <hpack.Decoder.import_context>` was malformed, used an unsupported version,
+    or failed consistency validation.
+
+    The target object is left completely unchanged when this error is raised:
+    validation always happens before any state is committed.
+
+    .. versionadded:: 4.3.0
+    """

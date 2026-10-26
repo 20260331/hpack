@@ -1,4 +1,8 @@
+import copy
 import itertools
+import pickle
+import random
+
 import pytest
 
 from hypothesis import given
@@ -10,11 +14,12 @@ from hpack import (
     HeaderTuple,
     NeverIndexedHeaderTuple,
     HPACKDecodingError,
+    InvalidContextError,
     InvalidTableIndex,
     OversizedHeaderListError,
     InvalidTableSizeError,
 )
-from hpack.hpack import _dict_to_iterable, _to_bytes
+from hpack.hpack import CONTEXT_VERSION, _dict_to_iterable, _to_bytes
 
 
 def test_to_bytes():
@@ -856,3 +861,488 @@ class TestDictToIterable:
 
         assert expected_special == received_special
         assert expected_boring == received_boring
+
+
+def _drive_pair(encoder, decoder, headers, new_size=None):
+    """Runs one header block through an encoder/decoder pair."""
+    if new_size is not None:
+        encoder.header_table_size = new_size
+        decoder.max_allowed_table_size = new_size
+    block = encoder.encode(headers, huffman=False)
+    decoded = decoder.decode(block)
+    return block, decoded
+
+
+class TestCompressionContextPortability:
+    """
+    Exporting and re-importing a compression context must make the next block
+    indistinguishable from the coder having kept running in this process.
+    """
+
+    def test_fresh_encoder_context_roundtrips(self):
+        encoder = Encoder()
+        resumed = Encoder()
+        resumed.import_context(encoder.export_context())
+
+        assert resumed.export_context() == encoder.export_context()
+        headers = [(':method', 'GET'), ('custom-key', 'custom-value')]
+        assert resumed.encode(headers, huffman=False) == encoder.encode(headers, huffman=False)
+
+    def test_fresh_decoder_context_roundtrips(self):
+        decoder = Decoder()
+        resumed = Decoder()
+        resumed.import_context(decoder.export_context())
+
+        assert resumed.export_context() == decoder.export_context()
+        data = b'\x40\x0acustom-key\x0dcustom-header'
+        assert resumed.decode(data) == decoder.decode(data)
+
+    def test_encoder_context_carries_pending_table_size_change(self):
+        """
+        A capacity update that has been configured but not yet signalled must
+        survive the transfer: the next block still leads with the size update
+        and is byte-identical to an encoder that was never moved.
+        """
+        original = Encoder()
+        original.encode(
+            [('custom-key', 'custom-value'), ('another-key', 'another-value')],
+            huffman=False,
+        )
+        # Shrink the table without encoding: the update is only queued.
+        original.header_table_size = 64
+        assert original.table_size_changes == [64]
+        assert original.header_table.resized is True
+
+        context = original.export_context()
+        resumed = Encoder()
+        resumed.import_context(context)
+
+        assert resumed.table_size_changes == [64]
+        assert resumed.header_table.resized is True
+        assert list(resumed.header_table.dynamic_entries) == \
+            list(original.header_table.dynamic_entries)
+
+        next_headers = [('custom-key', 'custom-value'), ('new-key', 'new-value')]
+        resumed_block = resumed.encode(next_headers, huffman=False)
+        original_block = original.encode(next_headers, huffman=False)
+
+        # Integer 64 with a 5-bit prefix, leading byte marked as size update.
+        assert resumed_block[:2] == b'\x3f\x21'
+        assert resumed_block == original_block
+        assert resumed.export_context() == original.export_context()
+
+    def test_decoder_context_carries_table_size_and_limits(self):
+        decoder = Decoder(max_header_list_size=12345)
+        encoder = Encoder()
+        _drive_pair(encoder, decoder, [('custom-key', 'custom-value')], new_size=512)
+
+        resumed = Decoder()
+        resumed.import_context(decoder.export_context())
+
+        assert resumed.max_header_list_size == 12345
+        assert resumed.max_allowed_table_size == 512
+        assert resumed.header_table_size == 512
+        assert resumed.export_context() == decoder.export_context()
+
+    def test_full_stream_continuous_after_migration(self):
+        """
+        Encode/decode a stream, migrate both coders mid-stream (including with
+        a pending resize), then keep going: blocks and decoded headers stay
+        identical and the contexts never diverge.
+        """
+        encoder = Encoder()
+        decoder = Decoder()
+
+        _drive_pair(encoder, decoder, [(':method', 'GET'), ('custom-a', '1')])
+        _drive_pair(encoder, decoder, [('custom-b', 'x' * 200), ('custom-a', '1')], new_size=256)
+        _drive_pair(encoder, decoder, [('custom-c', 'y'), ('custom-b', 'x' * 200)])
+
+        encoder_2 = Encoder()
+        encoder_2.import_context(encoder.export_context())
+        decoder_2 = Decoder()
+        decoder_2.import_context(decoder.export_context())
+
+        stream = [
+            ([('custom-a', '1'), ('custom-d', 'zzz')], None),
+            ([(':method', 'POST'), ('custom-c', 'y')], 128),
+            ([('custom-c', 'y'), ('custom-e', 'q' * 30)], None),
+        ]
+        for headers, new_size in stream:
+            block, decoded = _drive_pair(encoder, decoder, headers, new_size)
+            block_2, decoded_2 = _drive_pair(encoder_2, decoder_2, headers, new_size)
+            assert block_2 == block
+            assert decoded_2 == decoded
+            assert encoder_2.export_context() == encoder.export_context()
+            assert decoder_2.export_context() == decoder.export_context()
+
+        # Migrate once more while a table size change is still queued.
+        encoder.header_table_size = 64
+        decoder.max_allowed_table_size = 64
+        encoder_3 = Encoder()
+        encoder_3.import_context(encoder.export_context())
+        decoder_3 = Decoder()
+        decoder_3.import_context(decoder.export_context())
+
+        headers = [('custom-f', 'f')]
+        block, decoded = _drive_pair(encoder, decoder, headers)
+        block_3, decoded_3 = _drive_pair(encoder_3, decoder_3, headers)
+        assert block_3 == block
+        assert decoded_3 == decoded
+        assert encoder_3.export_context() == encoder.export_context()
+        assert decoder_3.export_context() == decoder.export_context()
+
+    def test_random_workload_matches_after_migration(self):
+        rng = random.Random(20260814)
+        names = [f'key-{i}' for i in range(8)]
+        values = ['', 'v', 'x' * 10, 'y' * 60]
+        sizes = [None, 4096, 512, 200, 64]
+
+        encoder = Encoder()
+        decoder = Decoder()
+
+        def random_request():
+            headers = [
+                (rng.choice(names), rng.choice(values))
+                for _ in range(rng.randint(1, 4))
+            ]
+            return headers, rng.choice(sizes)
+
+        for _ in range(20):
+            _drive_pair(encoder, decoder, *random_request())
+
+        # Hand the whole connection over to new coders.
+        encoder_2 = Encoder()
+        encoder_2.import_context(encoder.export_context())
+        decoder_2 = Decoder()
+        decoder_2.import_context(decoder.export_context())
+
+        for _ in range(40):
+            headers, new_size = random_request()
+            block, decoded = _drive_pair(encoder, decoder, headers, new_size)
+            block_2, decoded_2 = _drive_pair(encoder_2, decoder_2, headers, new_size)
+            assert block_2 == block
+            assert decoded_2 == decoded
+            assert encoder_2.export_context() == encoder.export_context()
+            assert decoder_2.export_context() == decoder.export_context()
+
+    def test_context_survives_pickle_for_cross_process_transfer(self):
+        encoder = Encoder()
+        decoder = Decoder()
+        _drive_pair(encoder, decoder, [('custom-key', 'custom-value')], new_size=256)
+
+        encoder_context = pickle.loads(pickle.dumps(encoder.export_context()))
+        decoder_context = pickle.loads(pickle.dumps(decoder.export_context()))
+
+        encoder_2 = Encoder()
+        encoder_2.import_context(encoder_context)
+        decoder_2 = Decoder()
+        decoder_2.import_context(decoder_context)
+
+        headers = [('custom-key', 'custom-value'), ('other', 'thing')]
+        block, decoded = _drive_pair(encoder, decoder, headers)
+        block_2, decoded_2 = _drive_pair(encoder_2, decoder_2, headers)
+        assert block_2 == block
+        assert decoded_2 == decoded
+
+    def test_context_accepts_tuple_shaped_entries(self):
+        # A document that went through a tuple-preserving transport is fine.
+        context = Encoder().export_context()
+        context['header_table']['entries'] = (
+            (b'custom-key', b'custom-value'),
+        )
+        size = 32 + len(b'custom-key') + len(b'custom-value')
+        context['header_table']['current_size'] = size
+        context['header_table']['maxsize'] = 4096
+
+        encoder = Encoder()
+        encoder.import_context(context)
+        assert list(encoder.header_table.dynamic_entries) == [
+            (b'custom-key', b'custom-value'),
+        ]
+
+
+class TestCompressionContextValidation:
+    """
+    Malformed contexts must be rejected with InvalidContextError, and the
+    rejection must leave the target coder untouched.
+    """
+
+    @pytest.fixture
+    def encoder_context(self):
+        encoder = Encoder()
+        encoder.encode([('custom-key', 'custom-value')], huffman=False)
+        return encoder.export_context()
+
+    @pytest.fixture
+    def decoder_context(self):
+        decoder = Decoder(max_header_list_size=1000)
+        decoder.max_allowed_table_size = 512
+        encoder = Encoder()
+        _drive_pair(encoder, decoder, [('custom-key', 'custom-value')], new_size=512)
+        return decoder.export_context()
+
+    @pytest.mark.parametrize('invalid', [None, 42, 'context', ['version'], (1, 2)])
+    def test_envelope_must_be_an_object(self, invalid):
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(invalid)
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(invalid)
+
+    def test_unknown_version_rejected(self, encoder_context):
+        encoder_context['version'] = CONTEXT_VERSION + 1
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_missing_version_rejected(self):
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context({'role': 'encoder'})
+
+    def test_role_mismatch_rejected(self, encoder_context, decoder_context):
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(encoder_context)
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(decoder_context)
+
+    def test_missing_role_rejected(self, encoder_context):
+        del encoder_context['role']
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_encoder_unexpected_field_rejected(self, encoder_context):
+        encoder_context['unexpected'] = 1
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_encoder_missing_field_rejected(self, encoder_context):
+        del encoder_context['table_size_changes']
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_decoder_unexpected_field_rejected(self, decoder_context):
+        decoder_context['unexpected'] = 1
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(decoder_context)
+
+    def test_decoder_missing_field_rejected(self, decoder_context):
+        del decoder_context['max_allowed_table_size']
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(decoder_context)
+
+    def test_header_table_must_be_an_object(self, encoder_context):
+        encoder_context['header_table'] = []
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_header_table_fields_must_be_exact(self, encoder_context):
+        encoder_context['header_table'] = {
+            'maxsize': 4096, 'current_size': 0, 'resized': False,
+        }
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_maxsize_must_be_plain_int(self, encoder_context):
+        encoder_context['header_table']['maxsize'] = True
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_maxsize_must_be_nonnegative(self, encoder_context):
+        encoder_context['header_table']['maxsize'] = -1
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_maxsize_must_be_uint32(self, encoder_context):
+        encoder_context['header_table']['maxsize'] = 2 ** 32
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_current_size_must_be_int(self, encoder_context):
+        encoder_context['header_table']['current_size'] = '54'
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_current_size_out_of_range(self, encoder_context):
+        encoder_context['header_table']['current_size'] = -3
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_resized_must_be_bool(self, encoder_context):
+        encoder_context['header_table']['resized'] = 1
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entries_must_be_a_list(self, encoder_context):
+        encoder_context['header_table']['entries'] = 'custom-key'
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entry_must_be_a_pair(self, encoder_context):
+        encoder_context['header_table']['entries'] = [7]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entry_must_have_two_elements(self, encoder_context):
+        encoder_context['header_table']['entries'] = [[b'a', b'b', b'c']]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entry_name_must_be_bytes(self, encoder_context):
+        encoder_context['header_table']['entries'] = [['custom-key', b'custom-value']]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entry_value_must_be_bytes(self, encoder_context):
+        encoder_context['header_table']['entries'] = [[b'custom-key', 'custom-value']]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entry_larger_than_maxsize_rejected(self):
+        context = Encoder().export_context()
+        context['header_table']['maxsize'] = 40
+        context['header_table']['entries'] = [[b'custom-key', b'custom-value']]
+        # current_size is validated only after entry fit, so leave it valid.
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(context)
+
+    def test_current_size_mismatch_rejected(self, encoder_context):
+        encoder_context['header_table']['current_size'] += 1
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_entries_exceeding_maxsize_rejected(self):
+        context = Encoder().export_context()
+        entries = [[b'custom-key', b'custom-value'], [b'another-key', b'another-value']]
+        context['header_table']['entries'] = entries
+        context['header_table']['maxsize'] = 100
+        context['header_table']['current_size'] = 54 + 56
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(context)
+
+    def test_table_size_changes_must_be_list(self, encoder_context):
+        encoder_context['table_size_changes'] = 4096
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_table_size_change_must_be_plain_int(self, encoder_context):
+        encoder_context['header_table']['resized'] = True
+        encoder_context['table_size_changes'] = [True]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_table_size_change_negative_rejected(self, encoder_context):
+        encoder_context['header_table']['resized'] = True
+        encoder_context['table_size_changes'] = [-1]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_table_size_change_uint32_rejected(self, encoder_context):
+        encoder_context['header_table']['resized'] = True
+        encoder_context['table_size_changes'] = [2 ** 32]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(encoder_context)
+
+    def test_resized_flag_without_queued_change_rejected(self):
+        context = Encoder().export_context()
+        context['header_table']['resized'] = True
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(context)
+
+    def test_queued_change_with_cleared_flag_is_restored_faithfully(self):
+        # Setting the same size while a change is queued leaves the change
+        # pending with the flag clear; this API-reachable state must survive.
+        context = Encoder().export_context()
+        context['table_size_changes'] = [4096]
+        encoder = Encoder()
+        encoder.import_context(context)
+        assert encoder.header_table.resized is False
+        assert encoder.table_size_changes == [4096]
+        # With the flag clear, no size update is emitted on the next block.
+        assert encoder.encode([(':method', 'GET')], huffman=False) == b'\x82'
+
+    def test_queued_change_must_match_current_maxsize(self):
+        context = Encoder().export_context()
+        context['header_table']['resized'] = True
+        context['table_size_changes'] = [256]
+        with pytest.raises(InvalidContextError):
+            Encoder().import_context(context)
+
+    def test_decoder_max_header_list_size_must_be_int(self, decoder_context):
+        decoder_context['max_header_list_size'] = None
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(decoder_context)
+
+    def test_decoder_max_header_list_size_nonnegative(self, decoder_context):
+        decoder_context['max_header_list_size'] = -1
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(decoder_context)
+
+    def test_decoder_max_allowed_table_size_must_be_int(self, decoder_context):
+        decoder_context['max_allowed_table_size'] = 512.0
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(decoder_context)
+
+    def test_decoder_max_allowed_table_size_nonnegative(self, decoder_context):
+        decoder_context['max_allowed_table_size'] = -1
+        with pytest.raises(InvalidContextError):
+            Decoder().import_context(decoder_context)
+
+    def test_pending_setting_shrink_window_is_restored(self, decoder_context):
+        # The application acknowledged a smaller table size but the peer has
+        # not shrunk yet: maxsize (512) exceeds max_allowed_table_size (100).
+        # This is a legal live state and must be carried over faithfully.
+        decoder_context['max_allowed_table_size'] = 100
+        decoder = Decoder()
+        decoder.import_context(decoder_context)
+        resumed = Decoder()
+        resumed.import_context(decoder.export_context())
+
+        # A block without a shrink update fails identically on both sides.
+        with pytest.raises(InvalidTableSizeError):
+            decoder.decode(b'\x82')
+        with pytest.raises(InvalidTableSizeError):
+            resumed.decode(b'\x82')
+
+        # The next block shrinking the table succeeds identically on a fresh
+        # copy restored before the rejected block (which does not mutate).
+        before = Decoder()
+        before.import_context(decoder_context)
+        after = Decoder()
+        after.import_context(decoder_context)
+        peer = Encoder()
+        peer.header_table_size = 100
+        shrink_block = peer.encode([('custom-key', 'custom-value')], huffman=False)
+        assert before.decode(shrink_block) == after.decode(shrink_block)
+        assert before.export_context() == after.export_context()
+
+    def test_failed_encoder_import_is_atomic(self):
+        encoder = Encoder()
+        encoder.header_table_size = 256
+        encoder.encode([('custom-key', 'custom-value')], huffman=False)
+        snapshot = copy.deepcopy(encoder.export_context())
+
+        invalid = copy.deepcopy(snapshot)
+        invalid['table_size_changes'] = 'nope'
+        with pytest.raises(InvalidContextError):
+            encoder.import_context(invalid)
+
+        assert encoder.export_context() == snapshot
+        control = Encoder()
+        control.import_context(snapshot)
+        headers = [('custom-key', 'custom-value'), ('new', 'v')]
+        assert encoder.encode(headers, huffman=False) == control.encode(headers, huffman=False)
+
+    def test_failed_decoder_import_is_atomic(self):
+        decoder = Decoder(max_header_list_size=2048)
+        encoder = Encoder()
+        _drive_pair(encoder, decoder, [('custom-key', 'custom-value')], new_size=256)
+        snapshot = copy.deepcopy(decoder.export_context())
+
+        invalid = copy.deepcopy(snapshot)
+        invalid['max_allowed_table_size'] = 'nope'
+        with pytest.raises(InvalidContextError):
+            decoder.import_context(invalid)
+
+        assert decoder.export_context() == snapshot
+        control = Decoder()
+        control.import_context(snapshot)
+        block = encoder.encode([('custom-key', 'custom-value')], huffman=False)
+        assert decoder.decode(block) == control.decode(block)

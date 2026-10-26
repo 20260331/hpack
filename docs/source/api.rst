@@ -4,10 +4,12 @@ hpack API
 This document provides the HPACK API.
 
 .. autoclass:: hpack.Encoder
-   :members: header_table_size, encode
+   :members: header_table_size, encode, export_context, import_context
 
 .. autoclass:: hpack.Decoder
-   :members: header_table_size, decode
+   :members: header_table_size, decode, export_context, import_context
+
+.. autodata:: hpack.CONTEXT_VERSION
 
 .. autoclass:: hpack.HeaderTuple
    :members: indexable
@@ -26,3 +28,5 @@ This document provides the HPACK API.
 .. autoclass:: hpack.OversizedHeaderListError
 
 .. autoclass:: hpack.InvalidTableSizeError
+
+.. autoclass:: hpack.InvalidContextError
